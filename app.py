@@ -261,5 +261,18 @@ async def finish(message: Message, state: FSMContext):
 async def main():
     await dp.start_polling(bot)
 
+
+import asyncio
+
+async def keep_alive():
+    while True:
+        await asyncio.sleep(3600)
+
+async def main():
+    await asyncio.gather(
+        dp.start_polling(bot),
+        keep_alive()
+    )
+
 if __name__ == "__main__":
     asyncio.run(main())
