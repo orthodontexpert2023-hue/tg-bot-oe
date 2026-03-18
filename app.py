@@ -258,8 +258,7 @@ async def finish(message: Message, state: FSMContext):
 # =====================
 # RUN
 # =====================
-async def main():
-    await dp.start_polling(bot)
+
 
 
 import asyncio
