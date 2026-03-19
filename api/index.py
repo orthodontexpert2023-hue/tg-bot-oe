@@ -1,28 +1,13 @@
 import os
 from datetime import datetime
 
+import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from mangum import Mangum
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove,
-    InputMediaPhoto,
-    InputMediaVideo,
-    Update,
-)
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
 from redis.asyncio import from_url
 
-# =====================
-# ENV
-# =====================
+app = FastAPI()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
 REDIS_URL = os.getenv("REDIS_URL")
@@ -49,277 +34,342 @@ if not BASE_URL:
 if not WEBHOOK_SECRET:
     raise ValueError("WEBHOOK_SECRET не найден")
 
-# ВАЖНО:
-# файл лежит в api/app.py, а внешний маршрут у Vercel будет без /api в FastAPI-роутах
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
+redis = from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+
+WEBHOOK_PATH = f"/api/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
-# =====================
-# BOT + STORAGE
-# =====================
-bot = Bot(token=BOT_TOKEN)
+TYPE_OPTIONS = {"Сторис", "Пост", "Рилс", "Другое"}
+PLATFORM_OPTIONS = {"Инстаграм", "ВК", "Ютуб", "Телеграм", "Комбинированный"}
 
-redis = from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
-storage = RedisStorage(
-    redis=redis,
-    key_builder=DefaultKeyBuilder(with_destiny=True),
-)
 
-dp = Dispatcher(storage=storage)
+def user_key(user_id: int) -> str:
+    return f"user:{user_id}"
 
-# =====================
-# FSM
-# =====================
-class Form(StatesGroup):
-    waiting_for_media = State()
-    waiting_for_type = State()
-    waiting_for_platform = State()
-    waiting_for_description = State()
-    waiting_for_deadline = State()
-    waiting_for_comment = State()
 
-# =====================
-# START
-# =====================
-@dp.message(F.text == "/start")
-async def start(message: Message, state: FSMContext):
-    await state.clear()
-    await state.set_state(Form.waiting_for_media)
+async def clear_user_state(user_id: int) -> None:
+    await redis.delete(user_key(user_id))
 
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Это все файлы")]],
-        resize_keyboard=True,
-    )
 
-    await message.answer(
-        "Загрузи файлы (фото, видео, документы, аудио, голосовые, кружки)\n"
-        "Когда закончишь — нажми кнопку",
-        reply_markup=keyboard,
-    )
+async def get_user_state(user_id: int) -> dict:
+    key = user_key(user_id)
+    data = await redis.hgetall(key)
+    if not data:
+        return {
+            "step": "",
+            "media": "[]",
+            "content_type": "",
+            "platform": "",
+            "description": "",
+            "deadline": "",
+            "comment": "",
+        }
+    data.setdefault("step", "")
+    data.setdefault("media", "[]")
+    data.setdefault("content_type", "")
+    data.setdefault("platform", "")
+    data.setdefault("description", "")
+    data.setdefault("deadline", "")
+    data.setdefault("comment", "")
+    return data
 
-# =====================
-# ПЕРЕЗАПУСК
-# =====================
-@dp.message(F.text == "Загрузить новые файлы")
-async def restart(message: Message, state: FSMContext):
-    await state.clear()
-    await state.set_state(Form.waiting_for_media)
 
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Это все файлы")]],
-        resize_keyboard=True,
-    )
+async def set_user_fields(user_id: int, **fields) -> None:
+    key = user_key(user_id)
+    cleaned = {}
+    for k, v in fields.items():
+        cleaned[k] = str(v)
+    if cleaned:
+        await redis.hset(key, mapping=cleaned)
 
-    await message.answer("Загрузи новые файлы", reply_markup=keyboard)
 
-# =====================
-# ПРИЁМ ФАЙЛОВ
-# =====================
-@dp.message(
-    (
-        F.photo
-        | F.video
-        | F.document
-        | F.audio
-        | F.voice
-        | F.video_note
-    ),
-    Form.waiting_for_media,
-)
-async def handle_media(message: Message, state: FSMContext):
-    data = await state.get_data()
-    media = data.get("media", [])
+def parse_media(raw: str) -> list:
+    if not raw:
+        return []
+    items = []
+    for chunk in raw.split("|||"):
+        if not chunk:
+            continue
+        parts = chunk.split("::", 1)
+        if len(parts) != 2:
+            continue
+        items.append({"type": parts[0], "file_id": parts[1]})
+    return items
 
-    file_id = None
-    file_type = None
 
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        file_type = "photo"
-    elif message.video:
-        file_id = message.video.file_id
-        file_type = "video"
-    elif message.document:
-        file_id = message.document.file_id
-        file_type = "document"
-    elif message.audio:
-        file_id = message.audio.file_id
-        file_type = "audio"
-    elif message.voice:
-        file_id = message.voice.file_id
-        file_type = "voice"
-    elif message.video_note:
-        file_id = message.video_note.file_id
-        file_type = "video_note"
+def dump_media(items: list) -> str:
+    return "|||".join(f"{item['type']}::{item['file_id']}" for item in items)
 
-    if file_id:
-        media.append({
-            "file_id": file_id,
-            "type": file_type,
-        })
 
-    await state.update_data(media=media)
-    await message.answer("Файл добавлен 👍")
+async def telegram_request(method: str, payload: dict | None = None) -> dict:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, json=payload or {})
+        response.raise_for_status()
+        return response.json()
 
-# =====================
-# ЗАВЕРШЕНИЕ ФАЙЛОВ
-# =====================
-@dp.message(F.text == "Это все файлы", Form.waiting_for_media)
-async def finish_media(message: Message, state: FSMContext):
-    await state.set_state(Form.waiting_for_type)
 
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[
-            KeyboardButton(text="Сторис"),
-            KeyboardButton(text="Пост"),
-            KeyboardButton(text="Рилс"),
-            KeyboardButton(text="Другое"),
-        ]],
-        resize_keyboard=True,
-    )
+async def send_message(chat_id: int, text: str, reply_markup: dict | None = None, parse_mode: str | None = None) -> None:
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    await telegram_request("sendMessage", payload)
 
-    await message.answer("Тип контента?", reply_markup=keyboard)
 
-# =====================
-# ТИП
-# =====================
-@dp.message(Form.waiting_for_type)
-async def get_type(message: Message, state: FSMContext):
-    await state.update_data(content_type=message.text)
-    await state.set_state(Form.waiting_for_platform)
+async def send_media_group(chat_id: int, media: list) -> None:
+    await telegram_request("sendMediaGroup", {
+        "chat_id": chat_id,
+        "media": media,
+    })
 
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[
-            KeyboardButton(text="Инстаграм"),
-            KeyboardButton(text="ВК"),
-            KeyboardButton(text="Ютуб"),
-            KeyboardButton(text="Телеграм"),
-            KeyboardButton(text="Комбинированный"),
-        ]],
-        resize_keyboard=True,
-    )
 
-    await message.answer("Для какой соцсети?", reply_markup=keyboard)
+async def send_document(chat_id: int, file_id: str) -> None:
+    await telegram_request("sendDocument", {
+        "chat_id": chat_id,
+        "document": file_id,
+    })
 
-# =====================
-# ПЛАТФОРМА
-# =====================
-@dp.message(Form.waiting_for_platform)
-async def get_platform(message: Message, state: FSMContext):
-    await state.update_data(platform=message.text)
-    await state.set_state(Form.waiting_for_description)
 
-    await message.answer("Описание?", reply_markup=ReplyKeyboardRemove())
+async def send_audio(chat_id: int, file_id: str) -> None:
+    await telegram_request("sendAudio", {
+        "chat_id": chat_id,
+        "audio": file_id,
+    })
 
-# =====================
-# ОПИСАНИЕ
-# =====================
-@dp.message(Form.waiting_for_description)
-async def get_description(message: Message, state: FSMContext):
-    await state.update_data(description=message.text)
-    await state.set_state(Form.waiting_for_deadline)
 
-    await message.answer("Дедлайн?")
+async def send_voice(chat_id: int, file_id: str) -> None:
+    await telegram_request("sendVoice", {
+        "chat_id": chat_id,
+        "voice": file_id,
+    })
 
-# =====================
-# ДЕДЛАЙН
-# =====================
-@dp.message(Form.waiting_for_deadline)
-async def get_deadline(message: Message, state: FSMContext):
-    await state.update_data(deadline=message.text)
-    await state.set_state(Form.waiting_for_comment)
 
-    await message.answer("Комментарий?")
+async def send_video_note(chat_id: int, file_id: str) -> None:
+    await telegram_request("sendVideoNote", {
+        "chat_id": chat_id,
+        "video_note": file_id,
+    })
 
-# =====================
-# ФИНАЛ
-# =====================
-@dp.message(Form.waiting_for_comment)
-async def finish(message: Message, state: FSMContext):
-    await state.update_data(comment=message.text)
-    data = await state.get_data()
 
-    media = data.get("media", [])
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+def keyboard(button_rows: list[list[str]]) -> dict:
+    return {
+        "keyboard": [[{"text": text} for text in row] for row in button_rows],
+        "resize_keyboard": True,
+    }
 
-    text = (
-        f"<b>{now}</b>\n\n"
-        f"<b>Тип:</b>\n{data.get('content_type')}\n\n"
-        f"<b>Платформа:</b>\n{data.get('platform')}\n\n"
-        f"<b>Описание:</b>\n{data.get('description')}\n\n"
-        f"<b>Дедлайн:</b>\n<u>{data.get('deadline')}</u>\n\n"
-        f"<b>Комментарий:</b>\n{data.get('comment')}"
-    )
 
-    media_group = []
-    other_files = []
+def remove_keyboard() -> dict:
+    return {"remove_keyboard": True}
 
-    for item in media:
-        if item["type"] in ["photo", "video"]:
-            if item["type"] == "photo":
-                media_group.append(InputMediaPhoto(media=item["file_id"]))
-            else:
-                media_group.append(InputMediaVideo(media=item["file_id"]))
-        else:
-            other_files.append(item)
 
-    await bot.send_message(chat_id=CHANNEL_ID, text=text, parse_mode="HTML")
+def extract_file(update_message: dict) -> tuple[str | None, str | None]:
+    if update_message.get("photo"):
+        return update_message["photo"][-1]["file_id"], "photo"
+    if update_message.get("video"):
+        return update_message["video"]["file_id"], "video"
+    if update_message.get("document"):
+        return update_message["document"]["file_id"], "document"
+    if update_message.get("audio"):
+        return update_message["audio"]["file_id"], "audio"
+    if update_message.get("voice"):
+        return update_message["voice"]["file_id"], "voice"
+    if update_message.get("video_note"):
+        return update_message["video_note"]["file_id"], "video_note"
+    return None, None
 
-    if media_group:
-        await bot.send_media_group(chat_id=CHANNEL_ID, media=media_group)
-
-    for item in other_files:
-        if item["type"] == "document":
-            await bot.send_document(CHANNEL_ID, item["file_id"])
-        elif item["type"] == "audio":
-            await bot.send_audio(CHANNEL_ID, item["file_id"])
-        elif item["type"] == "voice":
-            await bot.send_voice(CHANNEL_ID, item["file_id"])
-        elif item["type"] == "video_note":
-            await bot.send_video_note(CHANNEL_ID, item["file_id"])
-
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Загрузить новые файлы")]],
-        resize_keyboard=True,
-    )
-
-    await message.answer("Отправлено в канал 🚀", reply_markup=keyboard)
-    await state.clear()
-
-# =====================
-# FASTAPI
-# =====================
-app = FastAPI()
 
 @app.get("/")
 async def root():
     return {"ok": True, "message": "Bot is alive"}
 
+
 @app.get("/setup-webhook")
 async def setup_webhook():
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    info = await bot.get_webhook_info()
+    result = await telegram_request("setWebhook", {
+        "url": WEBHOOK_URL,
+        "drop_pending_updates": True,
+    })
+    info = await telegram_request("getWebhookInfo")
     return {
-        "ok": True,
-        "url": info.url,
-        "pending_update_count": info.pending_update_count,
-        "last_error_message": info.last_error_message,
+        "set_result": result,
+        "webhook_info": info,
     }
+
 
 @app.get("/delete-webhook")
 async def delete_webhook():
-    await bot.delete_webhook(drop_pending_updates=True)
-    return {"ok": True, "message": "Webhook deleted"}
+    result = await telegram_request("deleteWebhook", {
+        "drop_pending_updates": True,
+    })
+    return result
 
-@app.post("/webhook/{secret}")
+
+@app.post("/api/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     data = await request.json()
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
+    message = data.get("message")
+
+    if not message:
+        return JSONResponse({"ok": True})
+
+    chat = message.get("chat", {})
+    from_user = message.get("from", {})
+    chat_id = chat.get("id")
+    user_id = from_user.get("id")
+    text = message.get("text", "")
+
+    if not chat_id or not user_id:
+        return JSONResponse({"ok": True})
+
+    state = await get_user_state(user_id)
+    step = state.get("step", "")
+    media_items = parse_media(state.get("media", ""))
+
+    if text == "/start":
+        await clear_user_state(user_id)
+        await set_user_fields(
+            user_id,
+            step="waiting_for_media",
+            media="",
+            content_type="",
+            platform="",
+            description="",
+            deadline="",
+            comment="",
+        )
+        await send_message(
+            chat_id,
+            "Загрузи файлы (фото, видео, документы, аудио, голосовые, кружки)\nКогда закончишь — нажми кнопку",
+            reply_markup=keyboard([["Это все файлы"]]),
+        )
+        return JSONResponse({"ok": True})
+
+    if text == "Загрузить новые файлы":
+        await clear_user_state(user_id)
+        await set_user_fields(
+            user_id,
+            step="waiting_for_media",
+            media="",
+            content_type="",
+            platform="",
+            description="",
+            deadline="",
+            comment="",
+        )
+        await send_message(
+            chat_id,
+            "Загрузи новые файлы",
+            reply_markup=keyboard([["Это все файлы"]]),
+        )
+        return JSONResponse({"ok": True})
+
+    file_id, file_type = extract_file(message)
+    if step == "waiting_for_media" and file_id and file_type:
+        media_items.append({"file_id": file_id, "type": file_type})
+        await set_user_fields(user_id, media=dump_media(media_items))
+        await send_message(chat_id, "Файл добавлен 👍")
+        return JSONResponse({"ok": True})
+
+    if step == "waiting_for_media" and text == "Это все файлы":
+        await set_user_fields(user_id, step="waiting_for_type")
+        await send_message(
+            chat_id,
+            "Тип контента?",
+            reply_markup=keyboard([["Сторис", "Пост", "Рилс", "Другое"]]),
+        )
+        return JSONResponse({"ok": True})
+
+    if step == "waiting_for_type" and text in TYPE_OPTIONS:
+        await set_user_fields(user_id, step="waiting_for_platform", content_type=text)
+        await send_message(
+            chat_id,
+            "Для какой соцсети?",
+            reply_markup=keyboard([["Инстаграм", "ВК", "Ютуб", "Телеграм", "Комбинированный"]]),
+        )
+        return JSONResponse({"ok": True})
+
+    if step == "waiting_for_platform" and text in PLATFORM_OPTIONS:
+        await set_user_fields(user_id, step="waiting_for_description", platform=text)
+        await send_message(
+            chat_id,
+            "Описание?",
+            reply_markup=remove_keyboard(),
+        )
+        return JSONResponse({"ok": True})
+
+    if step == "waiting_for_description" and text:
+        await set_user_fields(user_id, step="waiting_for_deadline", description=text)
+        await send_message(chat_id, "Дедлайн?")
+        return JSONResponse({"ok": True})
+
+    if step == "waiting_for_deadline" and text:
+        await set_user_fields(user_id, step="waiting_for_comment", deadline=text)
+        await send_message(chat_id, "Комментарий?")
+        return JSONResponse({"ok": True})
+
+    if step == "waiting_for_comment" and text:
+        await set_user_fields(user_id, comment=text)
+        final_state = await get_user_state(user_id)
+        final_media = parse_media(final_state.get("media", ""))
+
+        now = datetime.now().strftime("%d.%m.%Y %H:%M")
+        final_text = (
+            f"<b>{now}</b>\n\n"
+            f"<b>Тип:</b>\n{final_state.get('content_type', '')}\n\n"
+            f"<b>Платформа:</b>\n{final_state.get('platform', '')}\n\n"
+            f"<b>Описание:</b>\n{final_state.get('description', '')}\n\n"
+            f"<b>Дедлайн:</b>\n<u>{final_state.get('deadline', '')}</u>\n\n"
+            f"<b>Комментарий:</b>\n{final_state.get('comment', '')}"
+        )
+
+        media_group = []
+        other_files = []
+
+        for item in final_media:
+            if item["type"] in ["photo", "video"]:
+                if item["type"] == "photo":
+                    media_group.append({
+                        "type": "photo",
+                        "media": item["file_id"],
+                    })
+                else:
+                    media_group.append({
+                        "type": "video",
+                        "media": item["file_id"],
+                    })
+            else:
+                other_files.append(item)
+
+        await send_message(CHANNEL_ID, final_text, parse_mode="HTML")
+
+        if media_group:
+            await send_media_group(CHANNEL_ID, media_group)
+
+        for item in other_files:
+            if item["type"] == "document":
+                await send_document(CHANNEL_ID, item["file_id"])
+            elif item["type"] == "audio":
+                await send_audio(CHANNEL_ID, item["file_id"])
+            elif item["type"] == "voice":
+                await send_voice(CHANNEL_ID, item["file_id"])
+            elif item["type"] == "video_note":
+                await send_video_note(CHANNEL_ID, item["file_id"])
+
+        await send_message(
+            chat_id,
+            "Отправлено в канал 🚀",
+            reply_markup=keyboard([["Загрузить новые файлы"]]),
+        )
+
+        await clear_user_state(user_id)
+        return JSONResponse({"ok": True})
 
     return JSONResponse({"ok": True})
-
-handler = Mangum(app)
