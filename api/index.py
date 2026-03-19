@@ -1,6 +1,5 @@
 import os
 from datetime import datetime
-import pytz
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -302,7 +301,9 @@ async def telegram_webhook(secret: str, request: Request):
         final_state = get_user_state(user_id)
         final_media = parse_media(final_state.get("media", ""))
 
-        now = datetime.now(pytz.timezone("Europe/Moscow")).strftime("%d.%m.%Y %H:%M")
+       from datetime import datetime, timedelta
+
+now = (datetime.utcnow() + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M")
         final_text = (
             f"<b>{now}</b>\n\n"
             f"<b>Тип:</b>\n{final_state.get('content_type', '')}\n\n"
