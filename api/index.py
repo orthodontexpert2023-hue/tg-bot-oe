@@ -4,13 +4,11 @@ from datetime import datetime
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from redis.asyncio import from_url
 
 app = FastAPI()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
-REDIS_URL = os.getenv("REDIS_URL")
 BASE_URL = os.getenv("BASE_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
@@ -25,16 +23,11 @@ try:
 except ValueError:
     raise ValueError("CHANNEL_ID должен быть числом, например -1001234567890")
 
-if not REDIS_URL:
-    raise ValueError("REDIS_URL не найден")
-
 if not BASE_URL:
     raise ValueError("BASE_URL не найден")
 
 if not WEBHOOK_SECRET:
     raise ValueError("WEBHOOK_SECRET не найден")
-
-redis = from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
 
 WEBHOOK_PATH = f"/api/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
@@ -42,45 +35,33 @@ WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 TYPE_OPTIONS = {"Сторис", "Пост", "Рилс", "Другое"}
 PLATFORM_OPTIONS = {"Инстаграм", "ВК", "Ютуб", "Телеграм", "Комбинированный"}
 
-
-def user_key(user_id: int) -> str:
-    return f"user:{user_id}"
+USER_STATE = {}
 
 
-async def clear_user_state(user_id: int) -> None:
-    await redis.delete(user_key(user_id))
+def user_default_state() -> dict:
+    return {
+        "step": "",
+        "media": "",
+        "content_type": "",
+        "platform": "",
+        "description": "",
+        "deadline": "",
+        "comment": "",
+    }
 
 
-async def get_user_state(user_id: int) -> dict:
-    key = user_key(user_id)
-    data = await redis.hgetall(key)
-    if not data:
-        return {
-            "step": "",
-            "media": "[]",
-            "content_type": "",
-            "platform": "",
-            "description": "",
-            "deadline": "",
-            "comment": "",
-        }
-    data.setdefault("step", "")
-    data.setdefault("media", "[]")
-    data.setdefault("content_type", "")
-    data.setdefault("platform", "")
-    data.setdefault("description", "")
-    data.setdefault("deadline", "")
-    data.setdefault("comment", "")
-    return data
+def get_user_state(user_id: int) -> dict:
+    return USER_STATE.get(user_id, user_default_state().copy())
 
 
-async def set_user_fields(user_id: int, **fields) -> None:
-    key = user_key(user_id)
-    cleaned = {}
-    for k, v in fields.items():
-        cleaned[k] = str(v)
-    if cleaned:
-        await redis.hset(key, mapping=cleaned)
+def set_user_fields(user_id: int, **fields) -> None:
+    if user_id not in USER_STATE:
+        USER_STATE[user_id] = user_default_state().copy()
+    USER_STATE[user_id].update(fields)
+
+
+def clear_user_state(user_id: int) -> None:
+    USER_STATE.pop(user_id, None)
 
 
 def parse_media(raw: str) -> list:
@@ -229,13 +210,13 @@ async def telegram_webhook(secret: str, request: Request):
     if not chat_id or not user_id:
         return JSONResponse({"ok": True})
 
-    state = await get_user_state(user_id)
+    state = get_user_state(user_id)
     step = state.get("step", "")
     media_items = parse_media(state.get("media", ""))
 
     if text == "/start":
-        await clear_user_state(user_id)
-        await set_user_fields(
+        clear_user_state(user_id)
+        set_user_fields(
             user_id,
             step="waiting_for_media",
             media="",
@@ -253,8 +234,8 @@ async def telegram_webhook(secret: str, request: Request):
         return JSONResponse({"ok": True})
 
     if text == "Загрузить новые файлы":
-        await clear_user_state(user_id)
-        await set_user_fields(
+        clear_user_state(user_id)
+        set_user_fields(
             user_id,
             step="waiting_for_media",
             media="",
@@ -274,12 +255,12 @@ async def telegram_webhook(secret: str, request: Request):
     file_id, file_type = extract_file(message)
     if step == "waiting_for_media" and file_id and file_type:
         media_items.append({"file_id": file_id, "type": file_type})
-        await set_user_fields(user_id, media=dump_media(media_items))
+        set_user_fields(user_id, media=dump_media(media_items))
         await send_message(chat_id, "Файл добавлен 👍")
         return JSONResponse({"ok": True})
 
     if step == "waiting_for_media" and text == "Это все файлы":
-        await set_user_fields(user_id, step="waiting_for_type")
+        set_user_fields(user_id, step="waiting_for_type")
         await send_message(
             chat_id,
             "Тип контента?",
@@ -288,7 +269,7 @@ async def telegram_webhook(secret: str, request: Request):
         return JSONResponse({"ok": True})
 
     if step == "waiting_for_type" and text in TYPE_OPTIONS:
-        await set_user_fields(user_id, step="waiting_for_platform", content_type=text)
+        set_user_fields(user_id, step="waiting_for_platform", content_type=text)
         await send_message(
             chat_id,
             "Для какой соцсети?",
@@ -297,7 +278,7 @@ async def telegram_webhook(secret: str, request: Request):
         return JSONResponse({"ok": True})
 
     if step == "waiting_for_platform" and text in PLATFORM_OPTIONS:
-        await set_user_fields(user_id, step="waiting_for_description", platform=text)
+        set_user_fields(user_id, step="waiting_for_description", platform=text)
         await send_message(
             chat_id,
             "Описание?",
@@ -306,18 +287,18 @@ async def telegram_webhook(secret: str, request: Request):
         return JSONResponse({"ok": True})
 
     if step == "waiting_for_description" and text:
-        await set_user_fields(user_id, step="waiting_for_deadline", description=text)
+        set_user_fields(user_id, step="waiting_for_deadline", description=text)
         await send_message(chat_id, "Дедлайн?")
         return JSONResponse({"ok": True})
 
     if step == "waiting_for_deadline" and text:
-        await set_user_fields(user_id, step="waiting_for_comment", deadline=text)
+        set_user_fields(user_id, step="waiting_for_comment", deadline=text)
         await send_message(chat_id, "Комментарий?")
         return JSONResponse({"ok": True})
 
     if step == "waiting_for_comment" and text:
-        await set_user_fields(user_id, comment=text)
-        final_state = await get_user_state(user_id)
+        set_user_fields(user_id, comment=text)
+        final_state = get_user_state(user_id)
         final_media = parse_media(final_state.get("media", ""))
 
         now = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -369,7 +350,7 @@ async def telegram_webhook(secret: str, request: Request):
             reply_markup=keyboard([["Загрузить новые файлы"]]),
         )
 
-        await clear_user_state(user_id)
+        clear_user_state(user_id)
         return JSONResponse({"ok": True})
 
     return JSONResponse({"ok": True})
