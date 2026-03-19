@@ -297,3 +297,7 @@ async def telegram_webhook(secret: str, request: Request):
     await dp.feed_update(bot, update)
 
     return JSONResponse({"ok": True})
+    
+    from mangum import Mangum
+
+handler = Mangum(app)
