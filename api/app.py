@@ -1,7 +1,7 @@
 import os
 from datetime import datetime
 
-from dotenv import load_dotenv
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -23,7 +23,7 @@ from redis.asyncio import from_url
 # =====================
 # ENV
 # =====================
-load_dotenv()
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
