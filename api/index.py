@@ -303,7 +303,7 @@ async def telegram_webhook(secret: str, request: Request):
 
        from datetime import datetime, timedelta
 
-now = (datetime.utcnow() + timedelta(hours=3)).strftime("%d.%m.%Y %H:%M")
+now = datetime.now().strftime("%d.%m.%Y %H:%M")
         final_text = (
             f"<b>{now}</b>\n\n"
             f"<b>Тип:</b>\n{final_state.get('content_type', '')}\n\n"
