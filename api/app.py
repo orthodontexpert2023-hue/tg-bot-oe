@@ -1,9 +1,9 @@
 import os
 from datetime import datetime
 
-
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from mangum import Mangum
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -13,7 +13,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     InputMediaPhoto,
     InputMediaVideo,
-    Update
+    Update,
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -23,26 +23,34 @@ from redis.asyncio import from_url
 # =====================
 # ENV
 # =====================
-
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
 REDIS_URL = os.getenv("REDIS_URL")
 BASE_URL = os.getenv("BASE_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден")
-if not CHANNEL_ID:
+
+if not CHANNEL_ID_RAW:
     raise ValueError("CHANNEL_ID не найден")
+
+try:
+    CHANNEL_ID = int(CHANNEL_ID_RAW)
+except ValueError:
+    raise ValueError("CHANNEL_ID должен быть числом, например -1001234567890")
+
 if not REDIS_URL:
     raise ValueError("REDIS_URL не найден")
+
 if not BASE_URL:
     raise ValueError("BASE_URL не найден")
+
 if not WEBHOOK_SECRET:
     raise ValueError("WEBHOOK_SECRET не найден")
 
-# ❗ ВАЖНО: убрали /api
+# ВАЖНО:
+# файл лежит в api/app.py, а внешний маршрут у Vercel будет без /api в FastAPI-роутах
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
@@ -54,7 +62,7 @@ bot = Bot(token=BOT_TOKEN)
 redis = from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
 storage = RedisStorage(
     redis=redis,
-    key_builder=DefaultKeyBuilder(with_destiny=True)
+    key_builder=DefaultKeyBuilder(with_destiny=True),
 )
 
 dp = Dispatcher(storage=storage)
@@ -80,13 +88,13 @@ async def start(message: Message, state: FSMContext):
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Это все файлы")]],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
 
     await message.answer(
         "Загрузи файлы (фото, видео, документы, аудио, голосовые, кружки)\n"
         "Когда закончишь — нажми кнопку",
-        reply_markup=keyboard
+        reply_markup=keyboard,
     )
 
 # =====================
@@ -99,7 +107,7 @@ async def restart(message: Message, state: FSMContext):
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Это все файлы")]],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
 
     await message.answer("Загрузи новые файлы", reply_markup=keyboard)
@@ -108,13 +116,15 @@ async def restart(message: Message, state: FSMContext):
 # ПРИЁМ ФАЙЛОВ
 # =====================
 @dp.message(
-    F.photo |
-    F.video |
-    F.document |
-    F.audio |
-    F.voice |
-    F.video_note,
-    Form.waiting_for_media
+    (
+        F.photo
+        | F.video
+        | F.document
+        | F.audio
+        | F.voice
+        | F.video_note
+    ),
+    Form.waiting_for_media,
 )
 async def handle_media(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -145,7 +155,7 @@ async def handle_media(message: Message, state: FSMContext):
     if file_id:
         media.append({
             "file_id": file_id,
-            "type": file_type
+            "type": file_type,
         })
 
     await state.update_data(media=media)
@@ -163,9 +173,9 @@ async def finish_media(message: Message, state: FSMContext):
             KeyboardButton(text="Сторис"),
             KeyboardButton(text="Пост"),
             KeyboardButton(text="Рилс"),
-            KeyboardButton(text="Другое")
+            KeyboardButton(text="Другое"),
         ]],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
 
     await message.answer("Тип контента?", reply_markup=keyboard)
@@ -184,9 +194,9 @@ async def get_type(message: Message, state: FSMContext):
             KeyboardButton(text="ВК"),
             KeyboardButton(text="Ютуб"),
             KeyboardButton(text="Телеграм"),
-            KeyboardButton(text="Комбинированный")
+            KeyboardButton(text="Комбинированный"),
         ]],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
 
     await message.answer("Для какой соцсети?", reply_markup=keyboard)
@@ -230,7 +240,6 @@ async def finish(message: Message, state: FSMContext):
     data = await state.get_data()
 
     media = data.get("media", [])
-
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
 
     text = (
@@ -271,7 +280,7 @@ async def finish(message: Message, state: FSMContext):
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Загрузить новые файлы")]],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
 
     await message.answer("Отправлено в канал 🚀", reply_markup=keyboard)
@@ -286,7 +295,22 @@ app = FastAPI()
 async def root():
     return {"ok": True, "message": "Bot is alive"}
 
-# ❗ ВАЖНО: путь совпадает с webhook
+@app.get("/setup-webhook")
+async def setup_webhook():
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    info = await bot.get_webhook_info()
+    return {
+        "ok": True,
+        "url": info.url,
+        "pending_update_count": info.pending_update_count,
+        "last_error_message": info.last_error_message,
+    }
+
+@app.get("/delete-webhook")
+async def delete_webhook():
+    await bot.delete_webhook(drop_pending_updates=True)
+    return {"ok": True, "message": "Webhook deleted"}
+
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
@@ -297,7 +321,5 @@ async def telegram_webhook(secret: str, request: Request):
     await dp.feed_update(bot, update)
 
     return JSONResponse({"ok": True})
-    
-    from mangum import Mangum
 
 handler = Mangum(app)
