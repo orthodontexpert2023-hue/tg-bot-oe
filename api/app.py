@@ -28,8 +28,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 REDIS_URL = os.getenv("REDIS_URL")
-BASE_URL = os.getenv("BASE_URL")  # например: https://my-bot.vercel.app
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # любое длинное секретное слово
+BASE_URL = os.getenv("BASE_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден")
@@ -42,7 +42,8 @@ if not BASE_URL:
 if not WEBHOOK_SECRET:
     raise ValueError("WEBHOOK_SECRET не найден")
 
-WEBHOOK_PATH = f"/api/webhook/{WEBHOOK_SECRET}"
+# ❗ ВАЖНО: убрали /api
+WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 # =====================
@@ -125,23 +126,18 @@ async def handle_media(message: Message, state: FSMContext):
     if message.photo:
         file_id = message.photo[-1].file_id
         file_type = "photo"
-
     elif message.video:
         file_id = message.video.file_id
         file_type = "video"
-
     elif message.document:
         file_id = message.document.file_id
         file_type = "document"
-
     elif message.audio:
         file_id = message.audio.file_id
         file_type = "audio"
-
     elif message.voice:
         file_id = message.voice.file_id
         file_type = "voice"
-
     elif message.video_note:
         file_id = message.video_note.file_id
         file_type = "video_note"
@@ -153,7 +149,6 @@ async def handle_media(message: Message, state: FSMContext):
         })
 
     await state.update_data(media=media)
-
     await message.answer("Файл добавлен 👍")
 
 # =====================
@@ -267,13 +262,10 @@ async def finish(message: Message, state: FSMContext):
     for item in other_files:
         if item["type"] == "document":
             await bot.send_document(CHANNEL_ID, item["file_id"])
-
         elif item["type"] == "audio":
             await bot.send_audio(CHANNEL_ID, item["file_id"])
-
         elif item["type"] == "voice":
             await bot.send_voice(CHANNEL_ID, item["file_id"])
-
         elif item["type"] == "video_note":
             await bot.send_video_note(CHANNEL_ID, item["file_id"])
 
@@ -286,7 +278,7 @@ async def finish(message: Message, state: FSMContext):
     await state.clear()
 
 # =====================
-# FASTAPI APP
+# FASTAPI
 # =====================
 app = FastAPI()
 
@@ -294,22 +286,8 @@ app = FastAPI()
 async def root():
     return {"ok": True, "message": "Bot is alive"}
 
-@app.get("/api/setup-webhook")
-async def setup_webhook():
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    info = await bot.get_webhook_info()
-    return {
-        "ok": True,
-        "webhook_url": info.url,
-        "pending_update_count": info.pending_update_count
-    }
-
-@app.get("/api/delete-webhook")
-async def delete_webhook():
-    await bot.delete_webhook(drop_pending_updates=True)
-    return {"ok": True, "message": "Webhook deleted"}
-
-@app.post("/api/webhook/{secret}")
+# ❗ ВАЖНО: путь совпадает с webhook
+@app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
