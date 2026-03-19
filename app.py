@@ -1,6 +1,9 @@
-import asyncio
 import os
 from datetime import datetime
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -9,23 +12,51 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardRemove,
     InputMediaPhoto,
-    InputMediaVideo
+    InputMediaVideo,
+    Update
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from dotenv import load_dotenv
+from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
+from redis.asyncio import from_url
 
 # =====================
 # ENV
 # =====================
-load_dotenv("t.env")
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+REDIS_URL = os.getenv("REDIS_URL")
+BASE_URL = os.getenv("BASE_URL")  # например: https://my-bot.vercel.app
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # любое длинное секретное слово
 
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не найден")
+if not CHANNEL_ID:
+    raise ValueError("CHANNEL_ID не найден")
+if not REDIS_URL:
+    raise ValueError("REDIS_URL не найден")
+if not BASE_URL:
+    raise ValueError("BASE_URL не найден")
+if not WEBHOOK_SECRET:
+    raise ValueError("WEBHOOK_SECRET не найден")
+
+WEBHOOK_PATH = f"/api/webhook/{WEBHOOK_SECRET}"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
+
+# =====================
+# BOT + STORAGE
+# =====================
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+
+redis = from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+storage = RedisStorage(
+    redis=redis,
+    key_builder=DefaultKeyBuilder(with_destiny=True)
+)
+
+dp = Dispatcher(storage=storage)
 
 # =====================
 # FSM
@@ -252,26 +283,39 @@ async def finish(message: Message, state: FSMContext):
     )
 
     await message.answer("Отправлено в канал 🚀", reply_markup=keyboard)
-
     await state.clear()
 
 # =====================
-# RUN
+# FASTAPI APP
 # =====================
+app = FastAPI()
 
+@app.get("/")
+async def root():
+    return {"ok": True, "message": "Bot is alive"}
 
+@app.get("/api/setup-webhook")
+async def setup_webhook():
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    info = await bot.get_webhook_info()
+    return {
+        "ok": True,
+        "webhook_url": info.url,
+        "pending_update_count": info.pending_update_count
+    }
 
-import asyncio
+@app.get("/api/delete-webhook")
+async def delete_webhook():
+    await bot.delete_webhook(drop_pending_updates=True)
+    return {"ok": True, "message": "Webhook deleted"}
 
-async def keep_alive():
-    while True:
-        await asyncio.sleep(3600)
+@app.post("/api/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-async def main():
-    await asyncio.gather(
-        dp.start_polling(bot),
-        keep_alive()
-    )
+    data = await request.json()
+    update = Update.model_validate(data)
+    await dp.feed_update(bot, update)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    return JSONResponse({"ok": True})
